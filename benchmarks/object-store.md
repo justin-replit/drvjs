@@ -2,13 +2,14 @@
 
 This experiment compares package tarballs, individual compressed content-addressed
 files, and batches of missing files. It changes no production drvjs behavior.
-All three paths run the same release-built Rust assembler.
+All five paths run the same release-built Rust assembler. The original object
+paths remain as controls alongside direct-to-store versions.
 
 ## Results: November 16, 2026
 
-**This prototype did not outperform tarballs.** The package-level file cache
-reduced bytes for a dependency update, but increased total installation time.
-These are local simulated-transport results, not cloud measurements.
+**Direct-to-store improved the prototype, but still did not outperform tarballs.**
+The original and revised clients were measured together, not compared across
+separate runs. These are local simulated-transport results, not cloud measurements.
 
 The workload is Vue v3.5.22's compiler-sfc closure: 98 input archives, 97 installed
 registry instances, and six importers including the synthetic root. It contains
@@ -17,14 +18,19 @@ cgroup-limited CPU cores and 12 GiB RAM on an Intel Xeon Platinum 8581C.
 
 Medians of five trials; seconds from fetch start through verified Rust assembly:
 
-| Added request delay | Scenario | Tarballs | Individual files | Batches |
-| --- | --- | ---: | ---: | ---: |
-| 0 ms | Cold client cache | 0.204 | 1.364 | 1.438 |
-| 0 ms | Source edit | 0.118 | 0.279 | 0.279 |
-| 0 ms | PostCSS update | 0.120 | 0.306 | 0.304 |
-| 20 ms | Cold client cache | 0.257 | 1.919 | 1.435 |
-| 20 ms | Source edit | 0.116 | 0.281 | 0.275 |
-| 20 ms | PostCSS update | 0.135 | 0.319 | 0.342 |
+| Delay | Scenario | Tar | Files old | Files direct | Batch old | Batch direct |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 0 ms | Cold cache | 0.209 | 1.404 | 1.093 | 1.518 | 1.135 |
+| 0 ms | Source edit | 0.127 | 0.284 | 0.169 | 0.314 | 0.171 |
+| 0 ms | PostCSS update | 0.139 | 0.310 | 0.179 | 0.342 | 0.199 |
+| 20 ms | Cold cache | 0.269 | 2.003 | 1.651 | 1.615 | 1.165 |
+| 20 ms | Source edit | 0.131 | 0.286 | 0.171 | 0.290 | 0.158 |
+| 20 ms | PostCSS update | 0.157 | 0.351 | 0.239 | 0.370 | 0.247 |
+
+At 20 ms, direct batching reduced install time by **28% cold, 45% on a source edit,
+and 33% on the dependency update** versus the original batch control. It removed
+1,352 / 98 / 120 intermediate file-copy operations respectively. The final
+verified copies into node_modules remain.
 
 | Transport | Cold requests | Cold payload | Update requests | Update payload |
 | --- | ---: | ---: | ---: | ---: |
@@ -32,29 +38,30 @@ Medians of five trials; seconds from fetch start through verified Rust assembly:
 | Individual files | 1,351 | 4,146,752 B | 23 | 36,487 B |
 | Batches | 11 | 3,850,617 B | 2 | 29,706 B |
 
-The batch update transferred 37.9% fewer response bytes than tarballs, but still
-took 2.54 times as long at 20 ms. With warm caches and no HTTP requests, the object
-paths spent about 85 ms discovering/reading metadata and 55 ms hydrating indexes,
-before about 130–140 ms of assembly. Tarball cache discovery was about 3 ms and
-assembly about 112 ms. The double integrity check and intermediate store copies
-are real prototype work, not excluded costs.
+Direct and original object modes use the same requests and payload bytes.
+The batch update transfers 37.9% fewer response bytes than tarballs. With warm
+caches, batch metadata/discovery plus hydration fell from about 145 ms to 25 ms.
+Native assembly still took about 133 ms. The remaining cost is measured, not
+hidden by calling a network cache hit free.
 
 At 20 ms, median cold time through NAR serialization and zstd-3 compression was
-0.450 s for tarballs, 2.129 s for files, and 1.646 s for batches. Compression added
-roughly 0.2 s; final compressed NARs were about 3.46 MB in every mode. Object
-granularity therefore did not eliminate final output serialization/transfer.
-Initial local cache preparation took 3.03 s, including 0.51 s registry downloading,
-0.63 s retained-store assembly and 1.89 s object encoding. No cloud upload was run.
+0.502 s for tarballs, 1.821 s for original batches, and 1.379 s for direct batches.
+That is a **24% reduction through NAR compression**, versus 28% through assembly.
+The corresponding reductions were 26% for source edits and 16% for dependency
+updates. Compression still added roughly 0.2 s and outputs were about 3.46 MB.
+Original prepared objects were reused unchanged; initial preparation was 3.03 s.
+No cloud upload or remote final-output transfer was run.
 
-All 90 installs passed tree comparison (1,937 files/symlinks, or 1,938 after the
-source edit). Both object transports passed independent offline pnpm verification;
-the updated fixture also passed. Five corrupted-manifest/content/archive cases
-were rejected.
+All 150 installs passed tree comparison (1,937 files/symlinks, or 1,938 after the
+source edit). All four object modes passed independent offline pnpm verification.
+Thirteen corruption cases were rejected, including warm-cache corruption, and
+both direct modes recovered after a cached index and file were deleted.
 
-[Raw samples, stage timings, provenance and validation](object-store-2026-11-16.json)
-include min/max values and all 18 comparison groups. Keep tarballs as the default
-on this evidence. Reducing metadata scans, intermediate copies and gateway
-recompression is a hypothesis for a subsequent prototype, not a measured fix.
+[Current samples, stages, copy counts and provenance](object-store-direct-2026-11-16.json)
+include min/max values and all 30 comparison groups.
+[The original 90-sample report](object-store-2026-11-16.json) is retained separately.
+Keep tarballs as the default on this workload. Gateway recompression and native
+client integration remain unmeasured optimization ideas.
 
 ## Protocol
 
@@ -68,15 +75,25 @@ permissions and paths remain in package indexes.
 It is **trusted preparation output**, not an unauthenticated remote manifest.
 Package indexes are themselves content-addressed objects. The client downloads
 missing indexes, verifies them, then downloads only missing file contents.
-All downloaded blobs are verified. Hydration writes a compatible pnpm store;
-drvjs's existing `--unpacked-store` path verifies file contents again while
-assembling the final installation.
+All downloaded blobs are verified. The original paths copy raw objects into a
+compatible pnpm store. Direct paths write verified downloads straight to that
+store, read each cached package index once, and list each relevant file shard
+once instead of checking every file separately. Only missing directories and
+files are created; cached indexes are not rewritten.
+
+Both versions use drvjs's existing `--unpacked-store` path, which verifies file
+contents again while assembling the final installation. The final verified copy
+into node_modules is retained so output mutation cannot alter the shared cache.
+Each install starts with fresh in-memory state; warm results do not depend on
+retaining parsed metadata in a daemon.
 
 | Mode | Transfer | Local reuse |
 | --- | --- | --- |
 | `tar` | Original npm gzip tarball per missing package | Compressed archives |
 | `files` | One gzip object per missing index or distinct file | Raw blobs and hydrated pnpm store |
 | `batch` | Up to 128 missing objects in one gzip-compressed framed response | Same as `files` |
+| `files-direct` | Same requests and bytes as `files` | Pnpm store only, no intermediate object copy |
+| `batch-direct` | Same requests and bytes as `batch` | Same as `files-direct` |
 
 The batch endpoint is a prototype gateway, **not an S3/GCS batch-read API**.
 It reads and decompresses local objects, frames their lengths and contents, and
@@ -86,7 +103,8 @@ not implemented. This experiment cannot establish a cloud-storage speedup or cos
 
 ## Measurement boundaries
 
-- Five trials per mode/scenario/delay; mode order rotates each trial.
+- Five trials per mode/scenario/delay; mode order rotates each trial. With five
+  modes, each occupies every order position once.
 - Delays are zero or 20 ms added once per HTTP request. These are simulated delays,
   not measured cloud latency. HTTP uses loopback and connection reuse, without TLS
   or a bandwidth cap.
@@ -98,6 +116,10 @@ not implemented. This experiment cannot establish a cloud-storage speedup or cos
 - Install time includes metadata/cache discovery, HTTP requests, decompression,
   integrity validation, local hydration, subprocess startup, source copying,
   package assembly, and dependency-link creation.
+- Direct modes include local store writes in `fetchSeconds`. Their separate
+  `hydrateSeconds` is zero because that phase is gone, not because writes are
+  excluded. `cacheCopyFiles` counts intermediate copies, not the final assembler
+  copies shared by both versions.
 - NAR serialization and zstd level-3 compression are timed separately. Each sample
   also reports their sum with installation time.
 - Preparation records registry downloads, retained-store generation and object
@@ -107,13 +129,13 @@ not implemented. This experiment cannot establish a cloud-storage speedup or cos
   and symlink targets are compared, with output-root strings normalized.
 - Nix evaluation, store import/registration, remote binary-cache publication and
   substitution, helper compilation, export, and application builds are **not**
-  timed. The tar downloader is the same experimental HTTP client as the other
+  timed. Node harness/server startup and prepared-spec loading are also outside
+  the timer. The tar downloader is the same experimental HTTP client as the other
   modes, not Nix's built-in fetcher. Existing `--cache-packages` and
   `--shared-dependencies` modes are not compared.
 
-Warm file-cache work still includes scanning package indexes and local file
-existence, rehydrating indexes, and assembler-side file verification. That work
-must be counted rather than treating a network cache hit as a free install.
+Warm direct-cache work still includes reading/verifying indexes, listing shards,
+and assembler-side verification. The original controls also recopy indexes.
 No one-file-per-Nix-derivation graph is introduced.
 
 ## Reproduce
@@ -159,12 +181,14 @@ pinned SRI. To check the updated fixture independently too:
 "$BIN" verify "$WORK/objects-after/retained"
 ```
 
-`validate` compares all three installed trees, runs independent offline pnpm
-verification for both object transports, and rejects altered package manifests,
-altered file contents, and altered tarballs. Expected final line:
+`validate` compares all five installed trees and runs independent offline pnpm
+verification for all four object modes. It rejects altered remote manifests,
+files and tarballs, plus altered warm-cache indexes and package.json files in both
+direct modes. Deleting a cached index and file also exercises missing-object
+recovery. Expected final line:
 
 ```text
-PASS: equal installed trees, independent offline pnpm, and five corruption cases
+PASS: equal installed trees, independent offline pnpm, thirteen corruption cases, and cache-eviction recovery
 ```
 
 The benchmark checks tree equivalence again on every trial/scenario. Raw samples,
@@ -182,5 +206,5 @@ The wire format is not intended as a production API.
 The pinned Vue compiler subset is one workload, with no patched packages or native
 postinstall execution. Results should not be generalized to a large monorepo,
 cross-project cache reuse, different dependency updates, or real GCS/S3. A useful
-next experiment must first reduce the measured local overhead, then test real
-same-region storage including request billing and final Nix output transfers.
+next experiment should test real same-region storage including request billing
+and final Nix output transfers before making deployment decisions.

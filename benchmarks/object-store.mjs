@@ -174,7 +174,7 @@ async function install(spec, mode, cache, out, binary, url, concurrency) {
   const started = performance.now();
   const fetchStart = performance.now();
   const tarballs = path.join(cache, 'tarballs.json');
-  let entries, missingObjects = 0;
+  let entries, missingObjects = 0, cacheCopyFiles = 0;
   if (mode === 'tar') {
     await pool(spec.archives, concurrency, async pkg => {
       const file = path.join(cache, 'archives', pkg.digest);
@@ -253,6 +253,7 @@ async function install(spec, mode, cache, out, binary, url, concurrency) {
       }
       await fs.mkdir(path.dirname(target), { recursive: true });
       await fs.copyFile(path.join(cache, 'objects', entry.digest), target);
+      cacheCopyFiles++;
       await fs.chmod(target, entry.mode);
     });
     await json(tarballs, []);
@@ -263,8 +264,111 @@ async function install(spec, mode, cache, out, binary, url, concurrency) {
     ...(entries ? ['--unpacked-store', store] : []),
   ], `${out}.log`);
   return { fetchSeconds, hydrateSeconds, assemblySeconds: assembly.seconds,
-    totalSeconds: seconds(started), missingObjects };
+    totalSeconds: seconds(started), missingObjects, cacheCopyFiles };
 }
+
+async function installDirect(spec, mode, cache, out, binary, url, concurrency) {
+  const started = performance.now(), store = path.join(cache, 'store');
+  const indexes = new Map(), missingIndexes = [];
+  await pool(spec.indexes, concurrency, async entry => {
+    let bytes;
+    try {
+      bytes = await fs.readFile(path.join(store, entry.path));
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      missingIndexes.push(entry);
+      return;
+    }
+    verify(bytes, entry.digest);
+    indexes.set(entry.path, JSON.parse(bytes));
+  });
+
+  async function download(entries, onSave) {
+    const byDigest = new Map();
+    for (const entry of entries) {
+      assert(entry.path.startsWith('v10/') && !entry.path.split('/').includes('..'));
+      assert(/^[a-f0-9]{128}$/.test(entry.digest));
+      if (!byDigest.has(entry.digest)) byDigest.set(entry.digest, []);
+      byDigest.get(entry.digest).push(entry);
+    }
+    await pool([...new Set(entries.map(entry => path.dirname(entry.path)))], concurrency, async directory =>
+      fs.mkdir(path.join(store, directory), { recursive: true }));
+    async function save(digest, bytes) {
+      verify(bytes, digest);
+      for (const entry of byDigest.get(digest)) {
+        const target = path.join(store, entry.path);
+        await fs.writeFile(target, bytes);
+        await fs.chmod(target, entry.mode);
+        onSave?.(entry, bytes);
+      }
+    }
+    const digests = [...byDigest.keys()];
+    if (mode === 'files-direct') {
+      await pool(digests, concurrency, async digest =>
+        save(digest, await unzip(await get(`${url}/objects/${digest}`))));
+    } else {
+      const batches = [];
+      for (let offset = 0; offset < digests.length; offset += 128) batches.push(digests.slice(offset, offset + 128));
+      await pool(batches, concurrency, async batch => {
+        const packed = await unzip(await get(`${url}/batch`, {
+          method: 'POST', body: JSON.stringify(batch),
+        }));
+        let offset = 0;
+        for (const digest of batch) {
+          const size = packed.readUInt32BE(offset);
+          offset += 4;
+          const bytes = packed.subarray(offset, offset + size);
+          assert.equal(bytes.length, size);
+          await save(digest, bytes);
+          offset += size;
+        }
+        assert.equal(offset, packed.length);
+      });
+    }
+    return digests.length;
+  }
+
+  // Preserve spec order regardless of concurrent reads or downloads.
+  missingIndexes.sort((a, b) => a.path.localeCompare(b.path));
+  let missingObjects = await download(missingIndexes, (entry, bytes) =>
+    indexes.set(entry.path, JSON.parse(bytes)));
+  const files = new Map();
+  for (const entry of spec.indexes) {
+    for (const info of Object.values(indexes.get(entry.path).files)) {
+      const [algorithm, encoded] = info.integrity.split('-');
+      assert.equal(algorithm, 'sha512');
+      const digest = Buffer.from(encoded, 'base64').toString('hex');
+      const executable = (info.mode & 0o111) !== 0;
+      const name = `v10/files/${digest.slice(0, 2)}/${digest.slice(2)}${executable ? '-exec' : ''}`;
+      files.set(name, { path: name, digest, mode: executable ? 0o755 : 0o644 });
+    }
+  }
+  const shards = new Map();
+  await pool([...new Set([...files.keys()].map(name => path.dirname(name)))], concurrency, async shard => {
+    let names;
+    try {
+      names = await fs.readdir(path.join(store, shard));
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      names = [];
+    }
+    shards.set(shard, new Set(names));
+  });
+  const missingFiles = [...files.values()].filter(entry =>
+    !shards.get(path.dirname(entry.path)).has(path.basename(entry.path)));
+  missingObjects += await download(missingFiles);
+  const tarballs = path.join(cache, 'tarballs.json');
+  await json(tarballs, []);
+  const fetchSeconds = seconds(started);
+  const assembly = await run(binary, [
+    'assemble', spec.source, out, tarballs, '--unpacked-store', store,
+  ], `${out}.log`);
+  return { fetchSeconds, hydrateSeconds: 0, assemblySeconds: assembly.seconds,
+    totalSeconds: seconds(started), missingObjects, cacheCopyFiles: 0 };
+}
+
+const modes = ['tar', 'files', 'batch', 'files-direct', 'batch-direct'];
+const installer = mode => mode.endsWith('-direct') ? installDirect : install;
 
 async function tree(root) {
   const rows = [];
@@ -299,7 +403,7 @@ async function benchmark(args) {
       memoryLimit: await fs.readFile('/sys/fs/cgroup/memory.max', 'utf8') },
     command: process.argv, concurrency, runs, before: before.corpus, after: after.corpus,
     preparation: { before: before.preparation, after: after.preparation },
-    scope: 'Loopback HTTP simulator. Added delay per request, no bandwidth cap or TLS. Batch gateway reads local objects. Total includes fetch, validation, hydration and real drvjs assembly. NAR compression is measured separately. Excludes Nix evaluation, import/registration, remote cache publication/substitution and application build. Warm is a real source-only edit.',
+    scope: 'Loopback HTTP simulator. Added delay per request, no bandwidth cap or TLS. Batch gateway reads local objects. Total includes fetch, validation, local writes and real drvjs assembly. Direct modes write into the pnpm store during fetch; zero separate hydration time does not exclude those writes. NAR compression is measured separately. Excludes Nix evaluation, import/registration, remote cache publication/substitution and application build. Warm is a real source-only edit. All clients start each install without in-memory cache state.',
     samples: [],
   };
   for (const latency of (args.latencies || '0,20').split(',').map(Number)) {
@@ -307,8 +411,7 @@ async function benchmark(args) {
     const service = await serve([beforeRoot, afterRoot], latency);
     try {
       for (let trial = 0; trial < runs; trial++) {
-        const modes = ['tar', 'files', 'batch'];
-        const order = modes.slice(trial % 3).concat(modes.slice(0, trial % 3));
+        const order = modes.slice(trial % modes.length).concat(modes.slice(0, trial % modes.length));
         const expected = new Map();
         for (const mode of order) {
           const cache = path.join(root, `cache-${latency}-${trial}-${mode}`);
@@ -316,7 +419,7 @@ async function benchmark(args) {
             const spec = scenario === 'update' ? after : scenario === 'warm' ? warm : before;
             const output = path.join(root, 'output');
             const prior = { ...service.metrics };
-            const result = await install(spec, mode, cache, output, args.binary, service.url, concurrency);
+            const result = await installer(mode)(spec, mode, cache, output, args.binary, service.url, concurrency);
             const sample = { latencyMs: latency, trial, mode, scenario, ...result,
               requests: service.metrics.requests - prior.requests,
               payloadBytes: service.metrics.bytes - prior.bytes };
@@ -354,7 +457,7 @@ async function benchmark(args) {
     const [latency, scenario, mode] = key.split('/');
     const samples = report.samples.filter(s => s.latencyMs === +latency && s.scenario === scenario && s.mode === mode);
     const row = { latencyMs: +latency, scenario, mode };
-    for (const field of ['totalSeconds', 'fetchSeconds', 'hydrateSeconds', 'assemblySeconds', 'narCompressionSeconds', 'throughNarSeconds', 'compressedNarBytes', 'requests', 'payloadBytes', 'missingObjects']) {
+    for (const field of ['totalSeconds', 'fetchSeconds', 'hydrateSeconds', 'assemblySeconds', 'narCompressionSeconds', 'throughNarSeconds', 'compressedNarBytes', 'requests', 'payloadBytes', 'missingObjects', 'cacheCopyFiles']) {
       row[field] = median(samples.map(s => s[field]));
     }
     row.minSeconds = Math.min(...samples.map(s => s.totalSeconds));
@@ -373,9 +476,9 @@ async function validate(args) {
   const service = await serve([poison, origin], 0);
   try {
     let expected;
-    for (const mode of ['tar', 'files', 'batch']) {
+    for (const mode of modes) {
       const cache = path.join(root, mode), output = path.join(root, 'output');
-      await install(spec, mode, cache, output, args.binary, service.url, 16);
+      await installer(mode)(spec, mode, cache, output, args.binary, service.url, 16);
       const signature = await tree(output);
       if (expected) assert.deepEqual(signature, expected);
       else expected = signature;
@@ -388,26 +491,64 @@ async function validate(args) {
     const originalIndex = await unzip(await fs.readFile(path.join(origin, 'objects', index.digest)));
     const info = Object.values(JSON.parse(originalIndex).files)[0];
     const digest = Buffer.from(info.integrity.split('-')[1], 'base64').toString('hex');
-    for (const [label, key, modes, expectedError] of [
-      ['manifest', `objects/${index.digest}`, ['files', 'batch'], /content digest mismatch/],
-      ['content', `objects/${digest}`, ['files', 'batch'], /content digest mismatch/],
+    for (const [label, key, transports, expectedError] of [
+      ['manifest', `objects/${index.digest}`, modes.filter(mode => mode !== 'tar'), /content digest mismatch/],
+      ['content', `objects/${digest}`, modes.filter(mode => mode !== 'tar'), /content digest mismatch/],
       ['archive', spec.archives[0].key, ['tar'], /archive SRI mismatch/],
     ]) {
       await write(path.join(poison, key), await zip(Buffer.from('tampered')));
-      for (const mode of modes) {
+      for (const mode of transports) {
         const limited = { ...spec, indexes: [index], archives: spec.archives.slice(0, 1) };
         await assert.rejects(
-          install(limited, mode, path.join(root, `${label}-${mode}`), path.join(root, 'rejected'), args.binary, service.url, 1),
+          installer(mode)(limited, mode, path.join(root, `${label}-${mode}`), path.join(root, 'rejected'), args.binary, service.url, 1),
           expectedError,
         );
       }
       await fs.rm(path.join(poison, key));
     }
+    for (const mode of modes.filter(mode => mode.endsWith('-direct'))) {
+      const cache = path.join(root, mode), output = path.join(root, 'output');
+      let installedIndex, packageInfo;
+      for (const entry of spec.indexes) {
+        const parsed = await readJSON(path.join(cache, 'store', entry.path));
+        if (expected.some(([name]) => name.endsWith(`/node_modules/${parsed.name}/package.json`))) {
+          installedIndex = entry;
+          packageInfo = parsed.files['package.json'];
+          break;
+        }
+      }
+      assert(installedIndex, 'fixture needs an installed registry package');
+      const indexFile = path.join(cache, 'store', installedIndex.path);
+      const savedIndex = await fs.readFile(indexFile);
+      await fs.writeFile(indexFile, 'tampered');
+      await assert.rejects(
+        installDirect(spec, mode, cache, output, args.binary, service.url, 16),
+        /content digest mismatch/,
+      );
+      await fs.writeFile(indexFile, savedIndex);
+      const fileDigest = Buffer.from(packageInfo.integrity.split('-')[1], 'base64').toString('hex');
+      const suffix = packageInfo.mode & 0o111 ? '-exec' : '';
+      const file = path.join(cache, 'store', 'v10/files', fileDigest.slice(0, 2), fileDigest.slice(2) + suffix);
+      await fs.writeFile(file, 'tampered');
+      await assert.rejects(
+        installDirect(spec, mode, cache, output, args.binary, service.url, 16),
+        /cached file integrity mismatch/,
+      );
+      await fs.rm(output, { recursive: true });
+      await fs.unlink(indexFile);
+      await fs.unlink(file);
+      const repaired = await installDirect(spec, mode, cache, output, args.binary, service.url, 16);
+      assert.equal(repaired.missingObjects, 2);
+      assert.deepEqual(await tree(output), expected);
+      await fs.rm(output, { recursive: true });
+    }
     await json(path.join(root, 'validation.json'), {
-      matchingEntries: expected.length, offlinePnpm: ['files', 'batch'],
-      rejected: ['tampered manifest: files/batch', 'tampered content: files/batch', 'tampered tarball'],
+      matchingEntries: expected.length, offlinePnpm: modes.filter(mode => mode !== 'tar'),
+      rejected: ['tampered manifest: all four object modes', 'tampered content: all four object modes', 'tampered tarball',
+        'tampered cached index: both direct modes', 'tampered cached package.json: both direct modes'],
+      recovered: ['evicted package index and file: both direct modes'],
     });
-    console.log('PASS: equal installed trees, independent offline pnpm, and five corruption cases');
+    console.log('PASS: equal installed trees, independent offline pnpm, thirteen corruption cases, and cache-eviction recovery');
   } finally {
     service.server.closeAllConnections();
     await new Promise(resolve => service.server.close(resolve));
